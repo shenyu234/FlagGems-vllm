@@ -440,6 +440,59 @@ def flash_attn_varlen_metax(*args, **kwargs):
     )
 
 
+def flash_attn_varlen_mthreads(*args, **kwargs):
+    """Adapt vLLM arguments to MUSA FlashAttention's paged-KV interface."""
+    (
+        query,
+        key_cache,
+        value_cache,
+        max_query_len,
+        cu_query_lens,
+        max_kv_len,
+        cu_seqlens_k,
+        seqused_k,
+        q_v,
+        _,  # dropout_p is always zero in this benchmark.
+        scale,
+        causal,
+        window_size,
+        soft_cap,
+        _,  # alibi_slopes is always None in this benchmark.
+        deterministic,
+        return_attn_probs,
+        block_tables,
+        return_softmax_lse,
+        out,
+        *_,
+    ) = args
+
+    from flash_attn_interface import flash_attn_varlen_func
+
+    # The native MUSA interface selects its own FlashAttention version.
+    kwargs.pop("fa_version", None)
+    return flash_attn_varlen_func(
+        query,
+        key_cache,
+        value_cache,
+        cu_seqlens_q=cu_query_lens,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        seqused_k=seqused_k,
+        qv=q_v,
+        softmax_scale=scale,
+        causal=causal,
+        window_size=window_size,
+        softcap=soft_cap,
+        deterministic=deterministic,
+        return_attn_probs=return_attn_probs,
+        block_table=block_tables,
+        return_softmax_lse=return_softmax_lse,
+        out=out,
+        **kwargs,
+    )
+
+
 @pytest.mark.skipif(
     utils.SkipVersion("vllm", "<0.9"),
     reason="vLLM version prior to 0.9 does not include the flash_attn_varlen_func API.",
@@ -459,6 +512,8 @@ def test_flash_attn_varlen_func(monkeypatch):
     elif vendor_name == "iluvatar":
         # iluvatar does not have updated vllm_flash_attn, use conversion wrapper
         flash_attn_varlen_func = flash_attn_varlen_legacy
+    elif vendor_name == "mthreads":
+        flash_attn_varlen_func = flash_attn_varlen_mthreads
     else:
         from vllm.vllm_flash_attn.flash_attn_interface import flash_attn_varlen_func
 
