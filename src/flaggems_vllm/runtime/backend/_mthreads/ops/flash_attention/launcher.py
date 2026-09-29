@@ -5,6 +5,7 @@ import math
 
 import torch
 
+from .cached import launch_cached, supports_cached
 from .common import validate_inputs
 from .direct import launch_direct
 from .scheduling import select_plan
@@ -99,6 +100,23 @@ def launch_attention(
             (q.shape[1], q.shape[0]), dtype=torch.float32, device=q.device
         )
         if q.shape[0]:
+            if supports_cached(
+                q, k, v, block_table, max_seqlen_q, window, softcap, alibi_slopes, plan
+            ):
+                launch_cached(
+                    q,
+                    k,
+                    v,
+                    out,
+                    lse,
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    scale,
+                    causal,
+                )
+                return (out, lse) if return_softmax_lse else out
             launch = launch_splitkv if plan.num_splits > 1 else launch_direct
             launch(
                 q,

@@ -19,7 +19,7 @@ pytestmark = [
 ]
 
 
-def make_case(dtype, paged, qlens, klens, heads=(8, 2), dim=64, strided=False):
+def make_case(dtype, paged, qlens, klens, heads=(8, 2), dim=64, strided=False, page=16):
     device = "musa"
     torch.manual_seed(20260929)
     hq, hk = heads
@@ -35,7 +35,6 @@ def make_case(dtype, paged, qlens, klens, heads=(8, 2), dim=64, strided=False):
         [0, *itertools.accumulate(klens)], device=device, dtype=torch.int32
     )
     if paged:
-        page = 16
         width = max(1, (max(klens, default=0) + page - 1) // page)
         shape = (max(1, len(qlens) * width + 3), page, hk, dim)
         k = torch.randn(shape, device=device, dtype=dtype)
@@ -358,6 +357,71 @@ def test_compact_graph_length_changes(monkeypatch):
         )
         args["seqused_k"].copy_(torch.tensor(klens, device="musa", dtype=torch.int32))
         args["q"].normal_()
+        expected, expected_lse = reference(args, qlens, klens)
+        graph.replay()
+        torch.musa.synchronize()
+        torch.testing.assert_close(actual.cpu(), expected, atol=0.02, rtol=0.02)
+        torch.testing.assert_close(
+            actual_lse.cpu(), expected_lse, atol=0.002, rtol=0.002
+        )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("page", [16, 32])
+def test_cached_reference(monkeypatch, dtype, causal, page):
+    from flaggems_vllm.runtime.backend._mthreads.ops.flash_attention import launcher
+
+    qlens, klens = [0, 65, 129, 318], [0, 0, 97, 513]
+    args = make_case(dtype, True, qlens, klens, heads=(4, 1), dim=256, page=page)
+    args["causal"] = causal
+    args["out"] = torch.empty_like(args["q"])
+    calls = []
+    original = launcher.launch_cached
+
+    def recording(*a, **kw):
+        compiled = original(*a, **kw)
+        calls.append(compiled)
+        assert compiled.n_spills == 0
+        return compiled
+
+    monkeypatch.setattr(launcher, "launch_cached", recording)
+    expected, expected_lse = reference(args, qlens, klens)
+    actual, actual_lse = flaggems_vllm.flash_attn_varlen_func(**args)
+    assert calls and actual is args["out"]
+    torch.testing.assert_close(actual.cpu(), expected, atol=0.02, rtol=0.02)
+    torch.testing.assert_close(actual_lse.cpu(), expected_lse, atol=0.002, rtol=0.002)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_cached_graph_updates(dtype):
+    qlens, klens = [0, 65, 129, 318], [0, 0, 97, 513]
+    args = make_case(dtype, True, qlens, klens, heads=(4, 1), dim=256)
+    args["causal"] = True
+    fn = flaggems_vllm.flash_attn_varlen_func
+    stream = torch.musa.Stream()
+    stream.wait_stream(torch.musa.current_stream())
+    with torch.musa.stream(stream):
+        for _ in range(3):
+            fn(**args)
+    torch.musa.synchronize()
+    graph = torch.musa.MUSAGraph()
+    with torch.musa.graph(graph, stream=stream):
+        actual, actual_lse = fn(**args)
+    for qlens, klens in [
+        ([65, 0, 129, 318], [0, 3, 513, 97]),
+        ([129, 65, 0, 318], [1, 0, 0, 0]),
+    ]:
+        args["cu_seqlens_q"].copy_(
+            torch.tensor(
+                [0, *itertools.accumulate(qlens)], device="musa", dtype=torch.int32
+            )
+        )
+        args["seqused_k"].copy_(torch.tensor(klens, device="musa", dtype=torch.int32))
+        args["q"].normal_()
+        args["k"].normal_()
+        args["v"].normal_()
+        args["block_table"].copy_(args["block_table"].flip(1))
         expected, expected_lse = reference(args, qlens, klens)
         graph.replay()
         torch.musa.synchronize()

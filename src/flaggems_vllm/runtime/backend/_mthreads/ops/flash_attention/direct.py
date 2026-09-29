@@ -123,7 +123,10 @@ def attention_kernel(
     for start in range(low, high, BN):
         cols = start + tl.arange(0, BN)
         if PAGED:
-            page = tl.load(TABLE + batch * TS + cols // PAGE, cols < klen, 0)
+            if BN <= PAGE and PAGE % BN == 0:
+                page = tl.load(TABLE + batch * TS + start // PAGE)
+            else:
+                page = tl.load(TABLE + batch * TS + cols // PAGE, cols < klen, 0)
             # Cache tensors in the active workload exceed signed 32-bit offsets.
             ko = page.to(tl.int64) * KP + (cols % PAGE) * KS
             vo = page.to(tl.int64) * VP + (cols % PAGE) * VS
@@ -260,4 +263,5 @@ def launch_direct(
         max(32, triton.next_power_of_2(batch)),
         num_warps=plan.num_warps,
         num_stages=plan.num_stages,
+        en_backend_opt=q.shape[2] == 256 and plan.head_pack == 8,
     )
