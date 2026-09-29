@@ -1279,6 +1279,43 @@ def flash_attn_varlen_func(
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
     """
+    if runtime.device.vendor_name == "mthreads":
+        from flaggems_vllm.runtime.backend._mthreads.ops.flash_attention import (
+            launch_attention,
+        )
+
+        return launch_attention(
+            q=q,
+            k=k,
+            v=v,
+            max_seqlen_q=max_seqlen_q,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_k=max_seqlen_k,
+            cu_seqlens_k=cu_seqlens_k,
+            seqused_k=seqused_k,
+            q_v=q_v,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap,
+            alibi_slopes=alibi_slopes,
+            deterministic=deterministic,
+            return_attn_probs=return_attn_probs,
+            block_table=block_table,
+            return_softmax_lse=return_softmax_lse,
+            out=out,
+            scheduler_metadata=scheduler_metadata,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            s_aux=s_aux,
+            num_splits=num_splits,
+            cp_world_size=cp_world_size,
+            cp_rank=cp_rank,
+            cp_tot_seqused_k=cp_tot_seqused_k,
+            fa_version=fa_version,
+        )
     if q.dtype == torch.int8 and runtime.device.vendor_name in ("hygon", "thead"):
         if runtime.device.vendor_name == "hygon":
             from flaggems_vllm.runtime.backend._hygon.fused import (
