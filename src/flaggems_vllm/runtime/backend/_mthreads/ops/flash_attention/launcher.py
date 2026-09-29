@@ -8,6 +8,7 @@ import torch
 from .common import validate_inputs
 from .direct import launch_direct
 from .scheduling import select_plan
+from .splitkv import launch_splitkv
 
 
 def launch_attention(
@@ -82,7 +83,15 @@ def launch_attention(
     softcap = float(softcap)
     if not math.isfinite(scale) or not math.isfinite(softcap) or softcap < 0:
         raise ValueError("Scale must be finite and softcap finite/nonnegative")
-    plan = select_plan(max_seqlen_q, q.shape[1] // k.shape[-2])
+    plan = select_plan(
+        max_seqlen_q,
+        q.shape[1] // k.shape[-2],
+        max_seqlen_k=max_seqlen_k,
+        total_q=q.shape[0],
+        num_heads=q.shape[1],
+        batch_size=cu_seqlens_q.numel() - 1,
+        head_size=q.shape[2],
+    )
     with torch.musa.device(q.device):
         if out is None:
             out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
@@ -90,7 +99,8 @@ def launch_attention(
             (q.shape[1], q.shape[0]), dtype=torch.float32, device=q.device
         )
         if q.shape[0]:
-            launch_direct(
+            launch = launch_splitkv if plan.num_splits > 1 else launch_direct
+            launch(
                 q,
                 k,
                 v,

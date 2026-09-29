@@ -4,6 +4,8 @@
 import triton
 import triton.language as tl
 
+from .ragged import compact_tile_coords
+
 
 @triton.jit
 def attention_kernel(
@@ -45,8 +47,25 @@ def attention_kernel(
     BM: tl.constexpr,
     BN: tl.constexpr,
     BD: tl.constexpr,
+    NUM_SPLITS: tl.constexpr = 1,
+    Q_TILES: tl.constexpr = 1,
+    HEAD_PACK: tl.constexpr = 1,
+    COMPACT: tl.constexpr = False,
+    BATCH: tl.constexpr = 1,
+    BB: tl.constexpr = 1,
 ):
     tile, batch, head = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    if COMPACT:
+        batch, tile, valid_task = compact_tile_coords(
+            tile, CUQ, BATCH, BB, BM, HEAD_PACK
+        )
+        if not valid_task:
+            return
+    if NUM_SPLITS > 1:
+        split_id = tile // Q_TILES
+        tile = tile % Q_TILES
+        O += split_id * TQ * HQ * D
+        LSE += split_id * HQ * TQ
     qstart = tl.load(CUQ + batch)
     qlen = tl.load(CUQ + batch + 1) - qstart
     if PAGED:
@@ -58,12 +77,13 @@ def attention_kernel(
     groups: tl.constexpr = HQ // HK
     rows = tl.arange(0, BM)
     if PACKED:
-        qi = tl.full((BM,), 0, tl.int32)
-        qh = head * groups + rows
-        kh = head
-        valid_q = (rows < groups) & (qlen > 0)
-        row_base = 0
-        row_end = 1
+        packed_row = tile * BM + rows
+        qi = packed_row // HEAD_PACK
+        qh = head * HEAD_PACK + packed_row % HEAD_PACK
+        kh = head * HEAD_PACK // groups
+        valid_q = qi < qlen
+        row_base = tile * BM // HEAD_PACK
+        row_end = tl.minimum(tl.cdiv((tile + 1) * BM, HEAD_PACK), qlen)
     else:
         qi = tile * BM + rows
         qh = tl.full((BM,), head, tl.int32)
@@ -88,6 +108,13 @@ def attention_kernel(
         high = tl.minimum(high, row_end + klen - qlen)
     if WR >= 0:
         high = tl.minimum(high, row_end + klen - qlen + WR)
+    if NUM_SPLITS > 1:
+        # Partition the actual masked span, not a host-side maximum KV length.
+        blocks = tl.cdiv(tl.maximum(high - low, 0), BN)
+        blocks_per_split = tl.cdiv(blocks, NUM_SPLITS)
+        split_start = low + split_id * blocks_per_split * BN
+        high = tl.minimum(high, split_start + blocks_per_split * BN)
+        low = split_start
     m = tl.full((BM,), -float("inf"), tl.float32)
     row_sum = tl.zeros((BM,), tl.float32)
     acc = tl.zeros((BM, BD), tl.float32)
@@ -138,7 +165,9 @@ def attention_kernel(
         m = new_m
     result = acc / tl.where(row_sum > 0, row_sum, 1.0)[:, None]
     lse = tl.where(
-        row_sum > 0, (m + tl.log2(row_sum)) * 0.6931471805599453, float("inf")
+        row_sum > 0,
+        (m + tl.log2(row_sum)) * 0.6931471805599453,
+        -float("inf") if NUM_SPLITS > 1 else float("inf"),
     )
     tl.store(
         O + (qstart + qi[:, None]).to(tl.int64) * OS + qh[:, None] * OH + dims[None, :],
@@ -167,12 +196,22 @@ def launch_direct(
     plan,
 ):
     paged = table is not None
-    packed = plan.family == "packed_decode"
     hkv = k.shape[-2]
+    head_pack = (
+        q.shape[1] // hkv
+        if plan.family in ("packed_decode", "split_decode")
+        else plan.head_pack
+    )
+    packed = head_pack > 1
+    q_tiles = triton.cdiv(maxq * head_pack, plan.block_m)
+    compact = plan.family == "compact"
+    batch = cuq.numel() - 1
+    if compact:
+        q_tiles = triton.cdiv(q.shape[0] * head_pack, plan.block_m) + batch - 1
     grid = (
-        1 if packed else triton.cdiv(maxq, plan.block_m),
-        cuq.numel() - 1,
-        hkv if packed else q.shape[1],
+        q_tiles * plan.num_splits,
+        1 if compact else batch,
+        q.shape[1] // head_pack,
     )
     return attention_kernel[grid](
         q,
@@ -196,7 +235,8 @@ def launch_direct(
         v.stride(0) if paged else 0,
         v.stride(-3),
         v.stride(-2),
-        *out.stride()[:2],
+        out.stride(-3),
+        out.stride(-2),
         table.stride(0) if paged else 0,
         alibi.stride(0) if alibi is not None and alibi.ndim == 2 else 0,
         k.shape[1] if paged else 1,
@@ -211,6 +251,13 @@ def launch_direct(
         plan.block_n,
         # Keep both MMA output dimensions in the validated S5000 range.
         max(64, triton.next_power_of_2(q.shape[2])),
+        plan.num_splits,
+        q_tiles,
+        head_pack,
+        compact,
+        batch,
+        # MUSA prefix scans require at least one full 32-lane warp.
+        max(32, triton.next_power_of_2(batch)),
         num_warps=plan.num_warps,
         num_stages=plan.num_stages,
     )

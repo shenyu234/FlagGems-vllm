@@ -1,0 +1,114 @@
+# Copyright 2026 FlagOS Contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Portable MetaX Split-KV idea with S5000 launch sizes and v1 LSE semantics."""
+
+import torch
+import triton
+import triton.language as tl
+
+from .direct import launch_direct
+
+
+@triton.jit
+def merge_splits_kernel(
+    O,
+    LSE,
+    PART_O,
+    PART_LSE,
+    TQ: tl.constexpr,
+    HQ: tl.constexpr,
+    D: tl.constexpr,
+    OS: tl.constexpr,
+    OH: tl.constexpr,
+    SPLITS: tl.constexpr,
+    BS: tl.constexpr,
+    BD: tl.constexpr,
+):
+    row, head = tl.program_id(0), tl.program_id(1)
+    splits = tl.arange(0, BS)
+    ls = tl.load(
+        PART_LSE + splits * HQ * TQ + head * TQ + row, splits < SPLITS, -float("inf")
+    )
+    valid = (splits < SPLITS) & (ls > -float("inf")) & (ls < float("inf"))
+    maximum = tl.max(tl.where(valid, ls, -float("inf")), 0)
+    safe_maximum = tl.where(maximum > -float("inf"), maximum, 0.0)
+    weights = tl.exp(tl.where(valid, ls - safe_maximum, -float("inf")))
+    denominator = tl.sum(weights, 0)
+    safe_denominator = tl.where(denominator > 0, denominator, 1.0)
+    dims = tl.arange(0, BD)
+    offsets = (splits[:, None].to(tl.int64) * TQ * HQ + row * HQ + head) * D + dims[
+        None, :
+    ]
+    partial = tl.load(PART_O + offsets, valid[:, None] & (dims[None, :] < D), 0.0)
+    result = tl.sum(partial * (weights / safe_denominator)[:, None], 0)
+    tl.store(O + row.to(tl.int64) * OS + head * OH + dims, result, dims < D)
+    final_lse = tl.where(
+        denominator > 0, safe_maximum + tl.log(safe_denominator), float("inf")
+    )
+    tl.store(LSE + head * TQ + row, final_lse)
+
+
+def launch_splitkv(
+    q,
+    k,
+    v,
+    out,
+    lse,
+    cuq,
+    cuk,
+    usedk,
+    table,
+    alibi,
+    maxq,
+    scale,
+    causal,
+    window,
+    softcap,
+    plan,
+):
+    """The graph owns its partial buffers; every valid row is written per replay."""
+    splits = plan.num_splits
+    if not 2 <= splits <= 32:
+        raise ValueError("MThreads Split-KV requires 2 to 32 splits")
+    total, heads, dim = q.shape
+    partial_out = torch.empty(
+        (splits, total, heads, dim), dtype=torch.float32, device=q.device
+    )
+    partial_lse = torch.empty(
+        (splits, heads, total), dtype=torch.float32, device=q.device
+    )
+    compiled = launch_direct(
+        q,
+        k,
+        v,
+        partial_out,
+        partial_lse,
+        cuq,
+        cuk,
+        usedk,
+        table,
+        alibi,
+        maxq,
+        scale,
+        causal,
+        window,
+        softcap,
+        plan,
+    )
+    merge_splits_kernel[(total, heads)](
+        out,
+        lse,
+        partial_out,
+        partial_lse,
+        total,
+        heads,
+        dim,
+        *out.stride()[:2],
+        splits,
+        triton.next_power_of_2(splits),
+        triton.next_power_of_2(dim),
+        num_warps=4,
+        num_stages=1,
+    )
+    return compiled

@@ -223,3 +223,145 @@ def test_one_dimensional_alibi():
     actual, lse = flaggems_vllm.flash_attn_varlen_func(**args)
     torch.testing.assert_close(actual.cpu(), expected, atol=0.02, rtol=0.02)
     torch.testing.assert_close(lse.cpu(), expected_lse, atol=0.002, rtol=0.002)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("paged", [True, False])
+@pytest.mark.parametrize("splits", [2, 3, 8, 32])
+@pytest.mark.parametrize("packed", ["direct", "gqa8", "decode"])
+def test_splitkv_reference(monkeypatch, dtype, paged, splits, packed):
+    from flaggems_vllm.runtime.backend._mthreads.ops.flash_attention import launcher
+    from flaggems_vllm.runtime.backend._mthreads.ops.flash_attention.scheduling import (
+        AttentionPlan,
+    )
+
+    decode = packed == "decode"
+    qlens = [1, 0, 1, 1] if decode else [3, 0, 17, 2]
+    klens = [11, 9, 137, 0] if decode else [2, 9, 137, 0]
+    heads = (16, 2) if packed == "gqa8" else (8, 2)
+    args = make_case(dtype, paged, qlens, klens, heads=heads, dim=80, strided=True)
+    args.update(causal=True, window_size=(35, 0), softcap=10.0)
+    args["alibi_slopes"] = torch.rand((heads[0],), device="musa") * 0.2
+    plan = AttentionPlan(
+        "split_decode" if decode else "split_kv",
+        16 if decode else 32,
+        32,
+        num_splits=splits,
+        head_pack=8 if packed == "gqa8" else 1,
+    )
+    monkeypatch.setattr(launcher, "select_plan", lambda *a, **kw: plan)
+    expected, expected_lse = reference(args, qlens, klens)
+    actual, actual_lse = flaggems_vllm.flash_attn_varlen_func(**args)
+    torch.testing.assert_close(actual.cpu(), expected, atol=0.02, rtol=0.02)
+    torch.testing.assert_close(actual_lse.cpu(), expected_lse, atol=0.002, rtol=0.002)
+
+
+def test_splitkv_graph_length_changes(monkeypatch):
+    from flaggems_vllm.runtime.backend._mthreads.ops.flash_attention import launcher
+    from flaggems_vllm.runtime.backend._mthreads.ops.flash_attention.scheduling import (
+        AttentionPlan,
+    )
+
+    qlens, klens = [1, 0, 2, 3], [157, 71, 89, 191]
+    args = make_case(torch.bfloat16, True, qlens, klens, dim=256)
+    args.update(causal=True, max_seqlen_q=3)
+    monkeypatch.setattr(
+        launcher,
+        "select_plan",
+        lambda *a, **kw: AttentionPlan("split_kv", 32, 32, num_splits=8),
+    )
+    fn = flaggems_vllm.flash_attn_varlen_func
+    stream = torch.musa.Stream()
+    stream.wait_stream(torch.musa.current_stream())
+    with torch.musa.stream(stream):
+        for _ in range(3):
+            fn(**args)
+    torch.musa.synchronize()
+    graph = torch.musa.MUSAGraph()
+    with torch.musa.graph(graph, stream=stream):
+        actual, actual_lse = fn(**args)
+    for new_qlens, new_klens in [
+        ([2, 1, 0, 3], [0, 1, 17, 190]),
+        ([0, 3, 2, 1], [0, 0, 2, 0]),
+    ]:
+        args["cu_seqlens_q"].copy_(
+            torch.tensor(
+                [0, *itertools.accumulate(new_qlens)], device="musa", dtype=torch.int32
+            )
+        )
+        args["seqused_k"].copy_(
+            torch.tensor(new_klens, device="musa", dtype=torch.int32)
+        )
+        args["q"].normal_()
+        expected, expected_lse = reference(args, new_qlens, new_klens)
+        graph.replay()
+        torch.musa.synchronize()
+        torch.testing.assert_close(actual.cpu(), expected, atol=0.02, rtol=0.02)
+        torch.testing.assert_close(
+            actual_lse.cpu(), expected_lse, atol=0.002, rtol=0.002
+        )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("paged", [True, False])
+@pytest.mark.parametrize("family", ["direct", "compact"])
+@pytest.mark.parametrize("pack", [2, 4, 8])
+def test_portable_tile_mapping(monkeypatch, dtype, paged, family, pack):
+    from flaggems_vllm.runtime.backend._mthreads.ops.flash_attention import launcher
+    from flaggems_vllm.runtime.backend._mthreads.ops.flash_attention.scheduling import (
+        AttentionPlan,
+    )
+
+    qlens, klens = [0, 1, 7, 33, 2], [0, 137, 0, 19, 65]
+    args = make_case(dtype, paged, qlens, klens, heads=(16, 2), dim=80, strided=True)
+    args.update(causal=True, window_size=(17, 0))
+    plan = AttentionPlan(family, 32, 32, head_pack=pack)
+    monkeypatch.setattr(launcher, "select_plan", lambda *a, **kw: plan)
+    expected, expected_lse = reference(args, qlens, klens)
+    actual, actual_lse = flaggems_vllm.flash_attn_varlen_func(**args)
+    torch.testing.assert_close(actual.cpu(), expected, atol=0.02, rtol=0.02)
+    torch.testing.assert_close(actual_lse.cpu(), expected_lse, atol=0.002, rtol=0.002)
+
+
+def test_compact_graph_length_changes(monkeypatch):
+    from flaggems_vllm.runtime.backend._mthreads.ops.flash_attention import launcher
+    from flaggems_vllm.runtime.backend._mthreads.ops.flash_attention.scheduling import (
+        AttentionPlan,
+    )
+
+    qlens, klens = [1, 0, 64, 31], [157, 71, 89, 191]
+    args = make_case(torch.bfloat16, True, qlens, klens, dim=128)
+    args.update(causal=True, max_seqlen_q=64)
+    monkeypatch.setattr(
+        launcher,
+        "select_plan",
+        lambda *a, **kw: AttentionPlan("compact", 32, 32, head_pack=4),
+    )
+    fn = flaggems_vllm.flash_attn_varlen_func
+    stream = torch.musa.Stream()
+    stream.wait_stream(torch.musa.current_stream())
+    with torch.musa.stream(stream):
+        for _ in range(3):
+            fn(**args)
+    torch.musa.synchronize()
+    graph = torch.musa.MUSAGraph()
+    with torch.musa.graph(graph, stream=stream):
+        actual, actual_lse = fn(**args)
+    for qlens, klens in [
+        ([2, 63, 0, 31], [0, 100, 17, 190]),
+        ([0, 32, 64, 0], [0, 0, 2, 0]),
+    ]:
+        args["cu_seqlens_q"].copy_(
+            torch.tensor(
+                [0, *itertools.accumulate(qlens)], device="musa", dtype=torch.int32
+            )
+        )
+        args["seqused_k"].copy_(torch.tensor(klens, device="musa", dtype=torch.int32))
+        args["q"].normal_()
+        expected, expected_lse = reference(args, qlens, klens)
+        graph.replay()
+        torch.musa.synchronize()
+        torch.testing.assert_close(actual.cpu(), expected, atol=0.02, rtol=0.02)
+        torch.testing.assert_close(
+            actual_lse.cpu(), expected_lse, atol=0.002, rtol=0.002
+        )
