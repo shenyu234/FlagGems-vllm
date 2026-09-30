@@ -395,7 +395,16 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
         data = existing_data
 
     with open(REPORT_FILE, "w") as f:
-        json.dump(data, f, indent=2, default=str)
+        json.dump(
+            data,
+            f,
+            indent=2,
+            default=lambda obj: (
+                obj.item()
+                if isinstance(obj, torch.Tensor) and obj.ndim == 0
+                else str(obj)
+            ),
+        )
 
 
 def pytest_collection_modifyitems(session, config, items):

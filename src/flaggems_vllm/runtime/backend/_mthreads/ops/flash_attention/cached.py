@@ -12,11 +12,17 @@ try:
 except ImportError:
     create_2d_tma_descriptor = None
 
+# TLE is optional so the original Triton 3.2 baseline environment can import us.
+try:
+    from .tle_prefill import launch_prefill
+except ImportError:
+    launch_prefill = None
+
 _MAX_CACHE_BYTES = 256 * 1024 * 1024
 
 
 def supports_cached(q, k, v, table, maxq, window, softcap, alibi, plan):
-    if create_2d_tma_descriptor is None or table is None:
+    if (create_2d_tma_descriptor is None and launch_prefill is None) or table is None:
         return False
     if q.shape[-1] != 256 or q.shape[0] < 512 or maxq <= 1:
         return False
@@ -151,6 +157,8 @@ def cached_attention_kernel(
 
 
 def launch_cached(q, k, v, out, lse, cuq, usedk, table, maxq, scale, causal):
+    if launch_prefill is not None:
+        return launch_prefill(q, k, v, out, lse, cuq, usedk, table, maxq, scale, causal)
     batch, hk, dim = table.shape[0], k.shape[2], q.shape[2]
     nk = triton.cdiv(table.shape[1] * k.shape[1], 64) * 64
     kc = torch.empty((batch * hk * dim, nk), device=q.device, dtype=q.dtype)

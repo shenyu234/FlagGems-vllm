@@ -212,6 +212,10 @@ class OperationAttribute:
 
 
 def custom_json_encoder(obj):
+    # Triton 3.6 timing quantiles can be scalar tensors. Convert only when
+    # serializing the finished result, outside the measured region.
+    if isinstance(obj, torch.Tensor) and obj.ndim == 0:
+        return obj.item()
     if isinstance(obj, torch.dtype):
         return str(obj)
     raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")

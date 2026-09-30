@@ -6,6 +6,12 @@ import triton.language as tl
 
 from .ragged import compact_tile_coords
 
+_BACKEND_OPT = (
+    "enable_backend_opt"
+    if tuple(int(x) for x in triton.__version__.split(".")[:2]) >= (3, 6)
+    else "en_backend_opt"
+)
+
 
 @triton.jit
 def attention_kernel(
@@ -263,5 +269,13 @@ def launch_direct(
         max(32, triton.next_power_of_2(batch)),
         num_warps=plan.num_warps,
         num_stages=plan.num_stages,
-        en_backend_opt=q.shape[2] == 256 and plan.head_pack == 8,
+        **{
+            _BACKEND_OPT: q.shape[2] == 256
+            and (
+                plan.head_pack == 8
+                # Triton 3.6 needs this for the existing ungrouped Split-KV
+                # route as well; Triton 3.2 keeps its original setting.
+                or (_BACKEND_OPT == "enable_backend_opt" and plan.family == "split_kv")
+            )
+        },
     )

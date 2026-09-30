@@ -59,7 +59,7 @@ package-dir = { "" = "src" }
 where = ["src"]
 
 [tool.setuptools.package-data]
-"flaggems_vllm.runtime" = ["*/**/*.yaml"]
+"flaggems_vllm.runtime" = ["*/**/*.yaml", "backend/_mthreads/ops/flash_attention/*.bc", "backend/_mthreads/ops/flash_attention/*.mu"]
 
 [tool.black]
 line-length = 88
