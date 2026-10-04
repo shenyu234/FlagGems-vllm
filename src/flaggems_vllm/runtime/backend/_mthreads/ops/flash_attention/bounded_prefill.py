@@ -137,6 +137,7 @@ def attention_body(
     NK: tl.constexpr,
     SCALE: tl.constexpr,
     CAUSAL: tl.constexpr,
+    PACK: tl.constexpr,
     ONLY_BOUNDED: tl.constexpr,
     SHIFT,
     tile,
@@ -144,24 +145,39 @@ def attention_body(
     head,
 ):
     qs = tle.gpu.alloc((128, 256), OUT.dtype.element_ty)
-    qb = tle.gpu.alloc_barrier(expect_bytes=65536)
+    if PACK == 1:
+        qb = tle.gpu.alloc_barrier(expect_bytes=65536)
     kb = tle.gpu.alloc_barriers(4, expect_bytes=32768)
     vb = tle.gpu.alloc_barriers(4, expect_bytes=32768)
     qstart = tl.load(CUQ + batch)
     qlen = tl.load(CUQ + batch + 1) - qstart
     klen = tl.load(USEDK + batch)
-    row_base = tile * 128
+    row_base = tile * 128 // PACK
     if row_base >= qlen:
         return
-    rows = row_base + tl.arange(0, 128)
+    packed_rows = tile * 128 + tl.arange(0, 128)
+    rows = packed_rows // PACK
+    qheads = head * PACK + packed_rows % PACK
     dims = tl.arange(0, 256)
-    kh = batch * HK + head // (HQ // HK)
+    kh = batch * HK + head * PACK // (HQ // HK)
     high = klen
     if CAUSAL:
-        high = tl.minimum(high, tl.minimum(row_base + 128, qlen) + klen - qlen)
+        high = tl.minimum(high, tl.minimum(row_base + 128 // PACK, qlen) + klen - qlen)
     high = tl.maximum(high, 0)
-    tle.gpu.copy(Q, qs, (128, 256), (qstart + row_base, head * 256), barrier=qb)
-    tle.gpu.barrier_wait(qb, phaseIdx=0)
+    if PACK > 1:
+        # Packing ragged query rows with GQA heads trims partial query tiles.
+        # Ordinary loads also handle multiple KV heads without descriptor reshape.
+        qvalues = tl.load(
+            Q
+            + ((qstart + rows[:, None]).to(tl.int64) * HQ + qheads[:, None]) * 256
+            + dims[None, :],
+            rows[:, None] < qlen,
+            0,
+        )
+        tl.store(tle.gpu.local_ptr(qs), qvalues)
+    else:
+        tle.gpu.copy(Q, qs, (128, 256), (qstart + row_base, head * 256), barrier=qb)
+        tle.gpu.barrier_wait(qb, phaseIdx=0)
     shift = SHIFT
     bounded: tl.constexpr = ONLY_BOUNDED
     maximum = tl.full((128,), -float("inf"), tl.float32)
@@ -249,10 +265,12 @@ def attention_body(
         (maximum + tl.log2(denominator)) * 0.6931471805599453,
         float("inf"),
     )
-    tl.store(LSE + head * TQ + qstart + rows, lse, rows < qlen)
+    tl.store(LSE + qheads * TQ + qstart + rows, lse, rows < qlen)
     output = acc / tl.where(denominator > 0, denominator, 1.0)[:, None]
     tl.store(
-        OUT + ((qstart + rows[:, None]).to(tl.int64) * HQ + head) * 256 + dims[None, :],
+        OUT
+        + ((qstart + rows[:, None]).to(tl.int64) * HQ + qheads[:, None]) * 256
+        + dims[None, :],
         output,
         rows[:, None] < qlen,
     )
@@ -277,35 +295,39 @@ def attention(
     CAUSAL: tl.constexpr,
     BATCH: tl.constexpr,
     COMPACT: tl.constexpr,
+    PACK: tl.constexpr,
+    GN: tl.constexpr,
 ):
     (tile, batch, head) = (tl.program_id(0), tl.program_id(1), tl.program_id(2))
     if COMPACT:
         (batch, tile, valid) = compact_tile_coords(
-            tile, CUQ, BATCH, max(32, triton.next_power_of_2(BATCH)), 128, 1
+            tile, CUQ, BATCH, max(32, triton.next_power_of_2(BATCH)), 128, PACK
         )
         if not valid:
             return
     qstart = tl.load(CUQ + batch)
     qlen = tl.load(CUQ + batch + 1) - qstart
-    row_base = tile * 128
+    row_base = tile * 128 // PACK
     if row_base >= qlen:
         return
-    rows = row_base + tl.arange(0, 128)
+    packed_rows = tile * 128 + tl.arange(0, 128)
+    rows = packed_rows // PACK
+    qheads = head * PACK + packed_rows % PACK
     dims = tl.arange(0, 256)
-    kh = batch * HK + head // (HQ // HK)
+    kh = batch * HK + head * PACK // (HQ // HK)
     eligible = False
     shift = 0.0
     qvalues = tl.load(
         QRAW
-        + ((qstart + rows[:, None]).to(tl.int64) * HQ + head) * 256
+        + ((qstart + rows[:, None]).to(tl.int64) * HQ + qheads[:, None]) * 256
         + dims[None, :],
         rows[:, None] < qlen,
         0,
     ).to(tl.float32)
     qnorm2 = tl.max(tl.sum(qvalues * qvalues, 1), 0)
-    ni = tl.arange(0, triton.next_power_of_2(triton.cdiv(NK, 32)))
+    ni = tl.arange(0, triton.next_power_of_2(triton.cdiv(NK, GN)))
     knorm2 = tl.max(
-        tl.load(NORM + kh * tl.cdiv(NK, 32) + ni, ni < tl.cdiv(NK, 32), 0), 0
+        tl.load(NORM + kh * tl.cdiv(NK, GN) + ni, ni < tl.cdiv(NK, GN), 0), 0
     )
     bound = tl.sqrt(qnorm2 * knorm2) * tl.abs(SCALE)
     eligible = (bound >= 0.0) & (bound <= 30.0)
@@ -325,6 +347,7 @@ def attention(
             NK,
             SCALE,
             CAUSAL,
+            PACK,
             True,
             shift,
             tile,
@@ -346,6 +369,7 @@ def attention(
             NK,
             SCALE,
             CAUSAL,
+            PACK,
             False,
             0.0,
             tile,
@@ -414,17 +438,25 @@ def launch_bounded_prefill(q, k, v, out, lse, cuq, usedk, table, maxq, scale, ca
     (bm, bn) = (128, 64)
     (batch, hk, dim) = (table.shape[0], k.shape[2], q.shape[2])
     nk = triton.cdiv(table.shape[1] * k.shape[1], bn) * bn
+    # Small batches need more gather CTAs to fill the device.
+    gn, gather_warps = (16, 8) if batch == 1 and nk <= 2048 else (32, 4)
+    compact = batch > 1
+    # Measured for mixed GQA8 prefill with a short paged cache. Long KV and
+    # single-request prefill retain one head per CTA.
+    pack = 8 if compact and q.shape[1] // hk == 8 and nk <= 8192 else 1
     kc = torch.empty((batch * hk * dim, nk), device=q.device, dtype=q.dtype)
     vc = torch.empty((batch * hk * nk, dim), device=q.device, dtype=q.dtype)
     norms = torch.empty(
-        (batch * hk, triton.cdiv(nk, 32)), device=q.device, dtype=torch.float32
+        (batch * hk, triton.cdiv(nk, gn)), device=q.device, dtype=torch.float32
     )
-    qd = TensorDescriptor(
-        q, (q.shape[0], q.shape[1] * dim), (q.shape[1] * dim, 1), (bm, dim)
-    )
+    qd = q
+    if pack == 1:
+        qd = TensorDescriptor(
+            q, (q.shape[0], q.shape[1] * dim), (q.shape[1] * dim, 1), (bm, dim)
+        )
     kd = TensorDescriptor(kc, (batch * hk * dim, nk), (nk, 1), (dim, bn))
     vd = TensorDescriptor(vc, (batch * hk * nk, dim), (dim, 1), (bn, dim))
-    gather_norm_kernel[triton.cdiv(nk, 32), batch * hk, 1](
+    gather_norm_kernel[triton.cdiv(nk, gn), batch * hk, 1](
         k,
         v,
         kc,
@@ -441,15 +473,17 @@ def launch_bounded_prefill(q, k, v, out, lse, cuq, usedk, table, maxq, scale, ca
         nk,
         True,
         bn,
+        BN=gn,
         BD=256,
-        num_warps=4,
+        num_warps=gather_warps,
         num_stages=1,
     )
-    compact = batch > 1
     tiles = (
-        triton.cdiv(q.shape[0], bm) + batch - 1 if compact else triton.cdiv(maxq, bm)
+        triton.cdiv(q.shape[0] * pack, bm) + batch - 1
+        if compact
+        else triton.cdiv(maxq * pack, bm)
     )
-    return attention[tiles, 1 if compact else batch, q.shape[1]](
+    return attention[tiles, 1 if compact else batch, q.shape[1] // pack](
         qd,
         q,
         norms,
@@ -467,6 +501,8 @@ def launch_bounded_prefill(q, k, v, out, lse, cuq, usedk, table, maxq, scale, ca
         causal,
         BATCH=batch,
         COMPACT=compact,
+        PACK=pack,
+        GN=gn,
         num_warps=16,
         num_stages=1,
         enable_backend_opt=True,
