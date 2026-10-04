@@ -435,6 +435,10 @@ def gather_norm_kernel(
 
 def launch_bounded_prefill(q, k, v, out, lse, cuq, usedk, table, maxq, scale, causal):
     """Positive-scale BF16 cached route; all preparation is replayed in Graph."""
+    from .triplet_prefill import launch_triplet, supports_triplet
+
+    if supports_triplet(q, k, table, maxq):
+        return launch_triplet(q, k, v, out, lse, cuq, usedk, table, maxq, scale, causal)
     (bm, bn) = (128, 64)
     (batch, hk, dim) = (table.shape[0], k.shape[2], q.shape[2])
     nk = triton.cdiv(table.shape[1] * k.shape[1], bn) * bn
