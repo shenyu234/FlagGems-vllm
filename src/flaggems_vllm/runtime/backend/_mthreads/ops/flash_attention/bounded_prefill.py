@@ -435,6 +435,12 @@ def gather_norm_kernel(
 
 def launch_bounded_prefill(q, k, v, out, lse, cuq, usedk, table, maxq, scale, causal):
     """Positive-scale BF16 cached route; all preparation is replayed in Graph."""
+    from .short_pair_prefill import launch_short_pair, supports_short_pair
+
+    if supports_short_pair(q, k, table, maxq, causal):
+        return launch_short_pair(
+            q, k, v, out, lse, cuq, usedk, table, maxq, scale, causal
+        )
     from .triplet_prefill import launch_triplet, supports_triplet
 
     if supports_triplet(q, k, table, maxq):
