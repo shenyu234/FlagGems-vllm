@@ -59,6 +59,8 @@ def attention_kernel(
     COMPACT: tl.constexpr = False,
     BATCH: tl.constexpr = 1,
     BB: tl.constexpr = 1,
+    NORM=None,
+    NORM_TILES: tl.constexpr = 1,
 ):
     tile, batch, head = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     if COMPACT:
@@ -121,7 +123,19 @@ def attention_kernel(
         split_start = low + split_id * blocks_per_split * BN
         high = tl.minimum(high, split_start + blocks_per_split * BN)
         low = split_start
+    eligible = False
+    fixed_m = 0.0
+    if NORM is not None:
+        qnorm = tl.max(tl.sum(q.to(tl.float32) * q.to(tl.float32), 1), 0)
+        ni = tl.arange(0, triton.next_power_of_2(NORM_TILES))
+        knorm = tl.max(
+            tl.load(NORM + (batch * HK + kh) * NORM_TILES + ni, ni < NORM_TILES, 0), 0
+        )
+        bound = tl.sqrt(qnorm * knorm) * tl.abs(SCALE)
+        eligible = (bound >= 0) & (bound <= 30)
+        fixed_m = tl.ceil(bound * 1.4426950408889634) + 2.0
     m = tl.full((BM,), -float("inf"), tl.float32)
+    m = tl.where(eligible, fixed_m, m)
     row_sum = tl.zeros((BM,), tl.float32)
     acc = tl.zeros((BM, BD), tl.float32)
     if HAS_ALIBI:
@@ -159,12 +173,17 @@ def attention_kernel(
         if WR >= 0:
             mask &= cols[None, :] <= pos + WR
         scores = tl.where(mask, scores * 1.4426950408889634, -float("inf"))
-        new_m = tl.maximum(m, tl.max(scores, 1))
-        safe_m = tl.where(new_m == -float("inf"), 0.0, new_m)
-        alpha = tl.exp2(m - safe_m)
-        p = tl.exp2(scores - safe_m[:, None])
-        row_sum = row_sum * alpha + tl.sum(p, 1)
-        acc *= alpha[:, None]
+        if eligible:
+            new_m = m
+            p = tl.exp2(scores - m[:, None])
+            row_sum += tl.sum(p, 1)
+        else:
+            new_m = tl.maximum(m, tl.max(scores, 1))
+            safe_m = tl.where(new_m == -float("inf"), 0.0, new_m)
+            alpha = tl.exp2(m - safe_m)
+            p = tl.exp2(scores - safe_m[:, None])
+            row_sum = row_sum * alpha + tl.sum(p, 1)
+            acc *= alpha[:, None]
         v = tl.load(
             V + vo[:, None] + kh * VH + dims[None, :],
             (cols[:, None] < klen) & (dims[None, :] < D),
@@ -203,6 +222,8 @@ def launch_direct(
     window,
     softcap,
     plan,
+    norm=None,
+    norm_tiles=1,
 ):
     paged = table is not None
     hkv = k.shape[-2]
@@ -267,6 +288,8 @@ def launch_direct(
         batch,
         # MUSA prefix scans require at least one full 32-lane warp.
         max(32, triton.next_power_of_2(batch)),
+        NORM=norm,
+        NORM_TILES=norm_tiles,
         num_warps=plan.num_warps,
         num_stages=plan.num_stages,
         **{

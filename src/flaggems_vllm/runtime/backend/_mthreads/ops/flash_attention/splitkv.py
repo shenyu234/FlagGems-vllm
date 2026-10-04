@@ -7,6 +7,7 @@ import torch
 import triton
 import triton.language as tl
 
+from .bounds import prepare_key_norms
 from .direct import launch_direct
 
 
@@ -78,6 +79,21 @@ def launch_splitkv(
     partial_lse = torch.empty(
         (splits, heads, total), dtype=torch.float32, device=q.device
     )
+    norms, norm_tiles = None, 1
+    if (
+        tuple(int(x) for x in triton.__version__.split(".")[:2]) >= (3, 6)
+        and q.dtype == torch.bfloat16
+        and dim == 256
+        and plan.head_pack == 8
+        and q.shape[1] // k.shape[-2] == 8
+        and table is not None
+        and table.shape[1] * k.shape[1] >= 8192
+        and window == (-1, -1)
+        and softcap == 0
+        and alibi is None
+        and scale > 0
+    ):
+        norms, norm_tiles = prepare_key_norms(k, table, usedk)
     compiled = launch_direct(
         q,
         k,
@@ -95,6 +111,8 @@ def launch_splitkv(
         window,
         softcap,
         plan,
+        norm=norms,
+        norm_tiles=norm_tiles,
     )
     merge_splits_kernel[(total, heads)](
         out,

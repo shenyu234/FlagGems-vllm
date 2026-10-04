@@ -417,6 +417,12 @@ def attention(
 
 def launch_prefill(q, k, v, out, lse, cuq, usedk, table, maxq, scale, causal):
     """Validated v6 prefill configuration; paged gather is part of every call."""
+    if q.dtype == torch.bfloat16 and scale > 0:
+        from .bounded_prefill import launch_bounded_prefill
+
+        return launch_bounded_prefill(
+            q, k, v, out, lse, cuq, usedk, table, maxq, scale, causal
+        )
     bm, bn = 128, 64
     batch, hk, dim = table.shape[0], k.shape[2], q.shape[2]
     nk = triton.cdiv(table.shape[1] * k.shape[1], bn) * bn

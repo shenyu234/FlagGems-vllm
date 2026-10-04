@@ -1,0 +1,474 @@
+# Copyright 2026 FlagOS Contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""BF16 prefill with GPU-validated fixed softmax reference and online fallback.
+
+Each invocation gathers fresh paged KV and its maximum squared K norm. Cauchy
+bounds every finite logit by ||Q|| * max ||K|| * abs(scale). A CTA with bound <=30
+uses a fixed reference ceil(bound * log2(e)) + 2. Thus its BF16 probabilities stay
+between roughly 2**-90 and 1 without per-tile rescaling. Other CTAs retain stable
+online softmax. P uses two buffers: the previous PV cannot race the next P store.
+The fast loop issues QK and previous PV before wait-all; no partial wait is used.
+"""
+from pathlib import Path
+
+import torch
+import triton
+import triton.experimental.tle.language as tle
+import triton.language as tl
+from triton.language import core
+from triton.tools.tensor_descriptor import TensorDescriptor
+
+from .ragged import compact_tile_coords
+from .tle_prefill import _MATH_LIB, exp2_select, pack_quads, rescale_o, unpack_quads
+
+_AFFINE_LIB = str(Path(__file__).with_name("math_affine4.bc"))
+
+
+@core.extern
+def affine_exp24_lo(lo, hi, scale, bias, _semantic=None):
+    return core.extern_elementwise(
+        "fa_affine4",
+        _AFFINE_LIB,
+        [lo, hi, scale, bias],
+        {
+            (tl.uint64, tl.uint64, tl.float32, tl.float32): (
+                "fa_affine_exp2_packed4_lo",
+                tl.uint64,
+            )
+        },
+        is_pure=True,
+        _semantic=_semantic,
+    )
+
+
+@core.extern
+def affine_exp24_hi(lo, hi, scale, bias, _semantic=None):
+    return core.extern_elementwise(
+        "fa_affine4",
+        _AFFINE_LIB,
+        [lo, hi, scale, bias],
+        {
+            (tl.uint64, tl.uint64, tl.float32, tl.float32): (
+                "fa_affine_exp2_packed4_hi",
+                tl.uint64,
+            )
+        },
+        is_pure=True,
+        _semantic=_semantic,
+    )
+
+
+@triton.jit
+def affine_exp2_quads(score, scale, bias):
+    (lo, hi) = pack_quads(score)
+    result_lo = affine_exp24_lo(lo, hi, scale, bias)
+    result_hi = affine_exp24_hi(lo, hi, scale, bias)
+    return unpack_quads(result_lo, result_hi, score.shape[0], score.shape[1])
+
+
+@triton.jit
+def update_softmax(
+    score,
+    maximum,
+    denominator,
+    rows,
+    row_base,
+    qlen,
+    klen,
+    i,
+    SCALE: tl.constexpr,
+    CAUSAL: tl.constexpr,
+    bounded,
+):
+    full = (i + 1) * 64 <= klen
+    if CAUSAL:
+        full &= (i + 1) * 64 <= row_base + klen - qlen + 1
+    if not full:
+        cols = i * 64 + tl.arange(0, 64)
+        valid = (rows[:, None] < qlen) & (cols[None, :] < klen)
+        if CAUSAL:
+            valid &= cols[None, :] <= rows[:, None] + klen - qlen
+        score = tl.where(valid, score, -float("inf"))
+    if bounded:
+        next_maximum = maximum
+    else:
+        next_maximum = tl.maximum(maximum, tl.max(score, 1))
+    safe_maximum = tl.where(next_maximum == -float("inf"), 0.0, next_maximum)
+    alpha = exp2_select(
+        (maximum - safe_maximum) * (SCALE * 1.4426950408889634), True, True, False
+    )
+    if bounded:
+        p = affine_exp2_quads(
+            score,
+            SCALE * 1.4426950408889634,
+            -(safe_maximum * (SCALE * 1.4426950408889634))[:, None],
+        )
+    else:
+        p = exp2_select(
+            score * (SCALE * 1.4426950408889634)
+            - (safe_maximum * (SCALE * 1.4426950408889634))[:, None],
+            True,
+            True,
+            False,
+        )
+    M: tl.constexpr = p.shape[0]
+    partial = tl.sum(tl.reshape(p, (M, 1, 8, 8)), 2)
+    partial = tl.reshape(partial, (M, 8))
+    if bounded:
+        denominator += partial
+    else:
+        denominator = denominator * alpha[:, None] + partial
+    return (p, alpha, next_maximum, denominator)
+
+
+@triton.jit
+def attention_body(
+    Q,
+    K,
+    V,
+    OUT,
+    LSE,
+    CUQ,
+    USEDK,
+    TQ: tl.constexpr,
+    HQ: tl.constexpr,
+    HK: tl.constexpr,
+    NK: tl.constexpr,
+    SCALE: tl.constexpr,
+    CAUSAL: tl.constexpr,
+    ONLY_BOUNDED: tl.constexpr,
+    SHIFT,
+    tile,
+    batch,
+    head,
+):
+    qs = tle.gpu.alloc((128, 256), OUT.dtype.element_ty)
+    qb = tle.gpu.alloc_barrier(expect_bytes=65536)
+    kb = tle.gpu.alloc_barriers(4, expect_bytes=32768)
+    vb = tle.gpu.alloc_barriers(4, expect_bytes=32768)
+    qstart = tl.load(CUQ + batch)
+    qlen = tl.load(CUQ + batch + 1) - qstart
+    klen = tl.load(USEDK + batch)
+    row_base = tile * 128
+    if row_base >= qlen:
+        return
+    rows = row_base + tl.arange(0, 128)
+    dims = tl.arange(0, 256)
+    kh = batch * HK + head // (HQ // HK)
+    high = klen
+    if CAUSAL:
+        high = tl.minimum(high, tl.minimum(row_base + 128, qlen) + klen - qlen)
+    high = tl.maximum(high, 0)
+    tle.gpu.copy(Q, qs, (128, 256), (qstart + row_base, head * 256), barrier=qb)
+    tle.gpu.barrier_wait(qb, phaseIdx=0)
+    shift = SHIFT
+    bounded: tl.constexpr = ONLY_BOUNDED
+    maximum = tl.full((128,), -float("inf"), tl.float32)
+    maximum = tl.where(bounded, shift / (SCALE * 1.4426950408889634), maximum)
+    denominator = tl.zeros((128, 8), tl.float32)
+    acc = tl.zeros((128, 256), tl.float32)
+    ps = tle.gpu.alloc((2, 128, 64), OUT.dtype.element_ty)
+    ks = tle.gpu.alloc((256, 64), OUT.dtype.element_ty)
+    vs = tle.gpu.alloc((64, 256), OUT.dtype.element_ty)
+    iterations = tl.cdiv(high, 64)
+    if iterations > 0:
+        tle.gpu.copy(K, ks, (256, 64), (kh * 256, 0), barrier=kb[0])
+        tle.gpu.barrier_wait(kb[0], phaseIdx=0)
+        score = tle.gpu.wgmma(qs, ks)
+        score = tle.gpu.wgmma_wait(0, score)
+        if iterations > 1:
+            tle.gpu.copy(K, ks, (256, 64), (kh * 256, 64), barrier=kb[1])
+        (p, alpha, maximum, denominator) = update_softmax(
+            score,
+            maximum,
+            denominator,
+            rows,
+            row_base,
+            qlen,
+            klen,
+            0,
+            SCALE,
+            CAUSAL,
+            bounded,
+        )
+        p_store = p.to(OUT.dtype.element_ty)
+        p_store = tl.reshape(
+            tl.permute(tl.reshape(p_store, (128, 8, 8)), (0, 2, 1)), (128, 64)
+        )
+        tl.store(tle.gpu.local_ptr(ps.slot(0)), p_store)
+        for i in range(1, iterations):
+            tle.gpu.copy(
+                V, vs, (64, 256), (kh * NK + (i - 1) * 64, 0), barrier=vb[(i - 1) % 4]
+            )
+            tle.gpu.barrier_wait(kb[i % 4], phaseIdx=i // 4 & 1)
+            score = tle.gpu.wgmma(qs, ks)
+            if ONLY_BOUNDED:
+                tle.gpu.barrier_wait(vb[(i - 1) % 4], phaseIdx=(i - 1) // 4 & 1)
+                pending_acc = tle.gpu.wgmma(ps.slot((i - 1) % 2), vs, acc)
+            score = tle.gpu.wgmma_wait(0, score)
+            if i + 1 < iterations:
+                tle.gpu.copy(
+                    K, ks, (256, 64), (kh * 256, (i + 1) * 64), barrier=kb[(i + 1) % 4]
+                )
+            if not ONLY_BOUNDED:
+                tle.gpu.barrier_wait(vb[(i - 1) % 4], phaseIdx=(i - 1) // 4 & 1)
+                pending_acc = tle.gpu.wgmma(ps.slot((i - 1) % 2), vs, acc)
+            (p, alpha, maximum, denominator) = update_softmax(
+                score,
+                maximum,
+                denominator,
+                rows,
+                row_base,
+                qlen,
+                klen,
+                i,
+                SCALE,
+                CAUSAL,
+                bounded,
+            )
+            acc = tle.gpu.wgmma_wait(0, pending_acc)
+            if bounded:
+                pass
+            else:
+                acc = rescale_o(acc, alpha, False)
+            p_store = p.to(OUT.dtype.element_ty)
+            p_store = tl.reshape(
+                tl.permute(tl.reshape(p_store, (128, 8, 8)), (0, 2, 1)), (128, 64)
+            )
+            tl.store(tle.gpu.local_ptr(ps.slot(i % 2)), p_store)
+        last = iterations - 1
+        tle.gpu.copy(V, vs, (64, 256), (kh * NK + last * 64, 0), barrier=vb[last % 4])
+        tle.gpu.barrier_wait(vb[last % 4], phaseIdx=last // 4 & 1)
+        acc = tle.gpu.wgmma(ps.slot(last % 2), vs, acc)
+        acc = tle.gpu.wgmma_wait(0, acc)
+    denominator = tl.sum(denominator, 1)
+    maximum *= SCALE * 1.4426950408889634
+    lse = tl.where(
+        denominator > 0,
+        (maximum + tl.log2(denominator)) * 0.6931471805599453,
+        float("inf"),
+    )
+    tl.store(LSE + head * TQ + qstart + rows, lse, rows < qlen)
+    output = acc / tl.where(denominator > 0, denominator, 1.0)[:, None]
+    tl.store(
+        OUT + ((qstart + rows[:, None]).to(tl.int64) * HQ + head) * 256 + dims[None, :],
+        output,
+        rows[:, None] < qlen,
+    )
+
+
+@triton.jit
+def attention(
+    Q,
+    QRAW,
+    NORM,
+    K,
+    V,
+    OUT,
+    LSE,
+    CUQ,
+    USEDK,
+    TQ: tl.constexpr,
+    HQ: tl.constexpr,
+    HK: tl.constexpr,
+    NK: tl.constexpr,
+    SCALE: tl.constexpr,
+    CAUSAL: tl.constexpr,
+    BATCH: tl.constexpr,
+    COMPACT: tl.constexpr,
+):
+    (tile, batch, head) = (tl.program_id(0), tl.program_id(1), tl.program_id(2))
+    if COMPACT:
+        (batch, tile, valid) = compact_tile_coords(
+            tile, CUQ, BATCH, max(32, triton.next_power_of_2(BATCH)), 128, 1
+        )
+        if not valid:
+            return
+    qstart = tl.load(CUQ + batch)
+    qlen = tl.load(CUQ + batch + 1) - qstart
+    row_base = tile * 128
+    if row_base >= qlen:
+        return
+    rows = row_base + tl.arange(0, 128)
+    dims = tl.arange(0, 256)
+    kh = batch * HK + head // (HQ // HK)
+    eligible = False
+    shift = 0.0
+    qvalues = tl.load(
+        QRAW
+        + ((qstart + rows[:, None]).to(tl.int64) * HQ + head) * 256
+        + dims[None, :],
+        rows[:, None] < qlen,
+        0,
+    ).to(tl.float32)
+    qnorm2 = tl.max(tl.sum(qvalues * qvalues, 1), 0)
+    ni = tl.arange(0, triton.next_power_of_2(triton.cdiv(NK, 32)))
+    knorm2 = tl.max(
+        tl.load(NORM + kh * tl.cdiv(NK, 32) + ni, ni < tl.cdiv(NK, 32), 0), 0
+    )
+    bound = tl.sqrt(qnorm2 * knorm2) * tl.abs(SCALE)
+    eligible = (bound >= 0.0) & (bound <= 30.0)
+    shift = tl.ceil(bound * 1.4426950408889634) + 2.0
+    if eligible:
+        attention_body(
+            Q,
+            K,
+            V,
+            OUT,
+            LSE,
+            CUQ,
+            USEDK,
+            TQ,
+            HQ,
+            HK,
+            NK,
+            SCALE,
+            CAUSAL,
+            True,
+            shift,
+            tile,
+            batch,
+            head,
+        )
+    else:
+        attention_body(
+            Q,
+            K,
+            V,
+            OUT,
+            LSE,
+            CUQ,
+            USEDK,
+            TQ,
+            HQ,
+            HK,
+            NK,
+            SCALE,
+            CAUSAL,
+            False,
+            0.0,
+            tile,
+            batch,
+            head,
+        )
+
+
+@triton.jit
+def gather_norm_kernel(
+    K,
+    V,
+    KC,
+    VC,
+    NORM,
+    TABLE,
+    USEDK,
+    HK: tl.constexpr,
+    D: tl.constexpr,
+    PAGE: tl.constexpr,
+    KP: tl.constexpr,
+    KS: tl.constexpr,
+    KH: tl.constexpr,
+    VP: tl.constexpr,
+    VS: tl.constexpr,
+    VH: tl.constexpr,
+    TS: tl.constexpr,
+    NK: tl.constexpr,
+    PERMUTE: tl.constexpr,
+    KVTILE: tl.constexpr,
+    BN: tl.constexpr = 32,
+    BD: tl.constexpr = 64,
+):
+    (block, bh, db) = (tl.program_id(0), tl.program_id(1), tl.program_id(2))
+    (batch, head) = (bh // HK, bh % HK)
+    cols = block * BN + tl.arange(0, BN)
+    if PERMUTE:
+        vcols = cols // KVTILE * KVTILE + cols % 8 * (KVTILE // 8) + cols % KVTILE // 8
+    else:
+        vcols = cols
+    dims = db * BD + tl.arange(0, BD)
+    length = tl.load(USEDK + batch)
+    page = tl.load(TABLE + batch * TS + cols // PAGE, cols < length, 0)
+    ko = page.to(tl.int64) * KP + cols % PAGE * KS + head * KH
+    vo = page.to(tl.int64) * VP + cols % PAGE * VS + head * VH
+    mask = (cols[:, None] < length) & (dims[None, :] < D)
+    key = tl.load(K + ko[:, None] + dims[None, :], mask, 0)
+    value = tl.load(V + vo[:, None] + dims[None, :], mask, 0)
+    norm = tl.max(tl.sum(key.to(tl.float32) * key.to(tl.float32), 1), 0)
+    tl.store(NORM + bh * tl.cdiv(NK, BN) + block, norm)
+    output_mask = (cols[:, None] < NK) & (dims[None, :] < D)
+    tl.store(
+        KC + (bh * D + dims[None, :]).to(tl.int64) * NK + cols[:, None],
+        key,
+        output_mask,
+    )
+    tl.store(
+        VC + (bh * NK + vcols[:, None]).to(tl.int64) * D + dims[None, :],
+        value,
+        output_mask,
+    )
+
+
+def launch_bounded_prefill(q, k, v, out, lse, cuq, usedk, table, maxq, scale, causal):
+    """Positive-scale BF16 cached route; all preparation is replayed in Graph."""
+    (bm, bn) = (128, 64)
+    (batch, hk, dim) = (table.shape[0], k.shape[2], q.shape[2])
+    nk = triton.cdiv(table.shape[1] * k.shape[1], bn) * bn
+    kc = torch.empty((batch * hk * dim, nk), device=q.device, dtype=q.dtype)
+    vc = torch.empty((batch * hk * nk, dim), device=q.device, dtype=q.dtype)
+    norms = torch.empty(
+        (batch * hk, triton.cdiv(nk, 32)), device=q.device, dtype=torch.float32
+    )
+    qd = TensorDescriptor(
+        q, (q.shape[0], q.shape[1] * dim), (q.shape[1] * dim, 1), (bm, dim)
+    )
+    kd = TensorDescriptor(kc, (batch * hk * dim, nk), (nk, 1), (dim, bn))
+    vd = TensorDescriptor(vc, (batch * hk * nk, dim), (dim, 1), (bn, dim))
+    gather_norm_kernel[triton.cdiv(nk, 32), batch * hk, 1](
+        k,
+        v,
+        kc,
+        vc,
+        norms,
+        table,
+        usedk,
+        hk,
+        dim,
+        k.shape[1],
+        *k.stride()[:3],
+        *v.stride()[:3],
+        table.stride(0),
+        nk,
+        True,
+        bn,
+        BD=256,
+        num_warps=4,
+        num_stages=1,
+    )
+    compact = batch > 1
+    tiles = (
+        triton.cdiv(q.shape[0], bm) + batch - 1 if compact else triton.cdiv(maxq, bm)
+    )
+    return attention[tiles, 1 if compact else batch, q.shape[1]](
+        qd,
+        q,
+        norms,
+        kd,
+        vd,
+        out,
+        lse,
+        cuq,
+        usedk,
+        q.shape[0],
+        q.shape[1],
+        hk,
+        nk,
+        scale,
+        causal,
+        BATCH=batch,
+        COMPACT=compact,
+        num_warps=16,
+        num_stages=1,
+        enable_backend_opt=True,
+        extern_libs={"fa_math4": _MATH_LIB, "fa_affine4": _AFFINE_LIB},
+    )
