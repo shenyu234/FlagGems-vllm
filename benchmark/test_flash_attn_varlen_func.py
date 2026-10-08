@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import inspect
+import os
 from functools import wraps
 from typing import Any, List, Optional
 
@@ -70,6 +71,16 @@ class FlashAttnVarlenBenchmark(base.Benchmark):
     """
 
     def set_shapes(self, shape_file_path: Optional[List[Any]] = None):
+        shape_set = os.environ.get("MTHREADS_FA_SHAPE_SET", "default")
+        if shape_set != "default":
+            if vendor_name != "mthreads":
+                raise ValueError("MTHREADS_FA_SHAPE_SET is a MThreads-only selector")
+            from .qwen36_flash_attn_cases import case_config, load_cases
+
+            self.trace_cases = load_cases(shape_set)
+            self.shapes = [case_config(case) for case in self.trace_cases]
+            return
+
         # Collected from Qwen3.6-35B-A3B: six TP1 cases followed by six TP4 cases.
         all_cu_seq_lens_q = [
             # TP1: short prefill (qwen36_tp1_p1024d1024_l0002).
@@ -202,7 +213,12 @@ class FlashAttnVarlenBenchmark(base.Benchmark):
         self.shapes = all_configs
 
     def get_input_iter(self, dtype):
-        for config in self.shapes:
+        for index, config in enumerate(self.shapes):
+            if getattr(self, "trace_cases", None):
+                from .qwen36_flash_attn_cases import case_seed
+
+                self.trace_case = self.trace_cases[index]
+                torch.manual_seed(case_seed(self.trace_case))
             yield self.flash_attn_varlen_input_fn(config, dtype, self.device)
 
     def flash_attn_varlen_input_fn(self, config, dtype, device):
