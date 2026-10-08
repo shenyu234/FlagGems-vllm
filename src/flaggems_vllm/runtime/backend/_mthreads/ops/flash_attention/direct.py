@@ -63,17 +63,17 @@ def attention_kernel(
     NORM_TILES: tl.constexpr = 1,
 ):
     tile, batch, head = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    if NUM_SPLITS > 1:
+        split_id = tile // Q_TILES
+        tile = tile % Q_TILES
+        O += split_id * TQ * HQ * D
+        LSE += split_id * HQ * TQ
     if COMPACT:
         batch, tile, valid_task = compact_tile_coords(
             tile, CUQ, BATCH, BB, BM, HEAD_PACK
         )
         if not valid_task:
             return
-    if NUM_SPLITS > 1:
-        split_id = tile // Q_TILES
-        tile = tile % Q_TILES
-        O += split_id * TQ * HQ * D
-        LSE += split_id * HQ * TQ
     qstart = tl.load(CUQ + batch)
     qlen = tl.load(CUQ + batch + 1) - qstart
     if PAGED:
@@ -234,10 +234,15 @@ def launch_direct(
     )
     packed = head_pack > 1
     q_tiles = triton.cdiv(maxq * head_pack, plan.block_m)
-    compact = plan.family == "compact"
     batch = cuq.numel() - 1
+    compact_upper = triton.cdiv(q.shape[0] * head_pack, plan.block_m) + batch - 1
+    compact = plan.family == "compact" or (
+        plan.num_splits > 1
+        and 1 < batch <= 128
+        and q_tiles * batch > 1.5 * compact_upper
+    )
     if compact:
-        q_tiles = triton.cdiv(q.shape[0] * head_pack, plan.block_m) + batch - 1
+        q_tiles = compact_upper
     grid = (
         q_tiles * plan.num_splits,
         1 if compact else batch,

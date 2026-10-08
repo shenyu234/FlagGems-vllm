@@ -1,7 +1,7 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Fresh paged-key norm bounds for the BF16 GQA8 Short-Q Split-KV path."""
+"""Fresh paged-key norm bounds for the BF16 grouped Short-Q Split-KV path."""
 
 import torch
 import triton

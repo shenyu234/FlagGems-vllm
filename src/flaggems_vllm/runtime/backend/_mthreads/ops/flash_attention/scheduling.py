@@ -33,7 +33,7 @@ def select_plan(
     MThreads-only offline tuning is intentional. NVIDIA's libtuner policy and
     the MetaX C550 launch configurations do not apply to this kernel.
     """
-    if max_seqlen_k >= 8192 and 0 < total_q <= 256 and max_seqlen_q <= 128:
+    if max_seqlen_k >= 8192 and 0 < total_q <= 256 and max_seqlen_q <= 256:
         packed = max_seqlen_q == 1 and head_groups <= 16
         ctas = (
             batch_size * (num_heads // head_groups)
@@ -44,9 +44,11 @@ def select_plan(
         splits = min(32, 1 << (target - 1).bit_length())
         bytes_per_split = total_q * num_heads * (head_size + 1) * 4
         splits = min(splits, _MAX_PARTIAL_BYTES // max(1, bytes_per_split))
-        # The measured GQA8 short-query path benefits from sharing one KV tile
-        # across its heads. GQA4 and long prefill retain the ungrouped v1 path.
+        # Share one KV tile across grouped heads for short queries.
+        # Long prefill retains its separate scheduling policy.
         head_pack = 8 if head_groups == 8 and not packed else 1
+        if head_groups == 4 and head_size == 256 and not packed:
+            head_pack = 4
         if splits >= 2:
             return AttentionPlan(
                 "split_decode" if packed else "split_kv",

@@ -84,8 +84,8 @@ def launch_splitkv(
         tuple(int(x) for x in triton.__version__.split(".")[:2]) >= (3, 6)
         and q.dtype == torch.bfloat16
         and dim == 256
-        and plan.head_pack == 8
-        and q.shape[1] // k.shape[-2] == 8
+        and plan.head_pack in (4, 8)
+        and q.shape[1] // k.shape[-2] == plan.head_pack
         and table is not None
         and table.shape[1] * k.shape[1] >= 8192
         and window == (-1, -1)
