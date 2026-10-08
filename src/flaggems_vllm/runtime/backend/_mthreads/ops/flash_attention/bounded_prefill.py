@@ -454,6 +454,8 @@ def launch_bounded_prefill(q, k, v, out, lse, cuq, usedk, table, maxq, scale, ca
     # Measured for mixed GQA8 prefill with a short paged cache. Long KV and
     # single-request prefill retain one head per CTA.
     pack = 8 if compact and q.shape[1] // hk == 8 and nk <= 8192 else 1
+    if compact and q.shape[1] // hk == 4 and nk <= 2048:
+        pack = 4
     kc = torch.empty((batch * hk * dim, nk), device=q.device, dtype=q.dtype)
     vc = torch.empty((batch * hk * nk, dim), device=q.device, dtype=q.dtype)
     norms = torch.empty(
