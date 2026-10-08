@@ -675,14 +675,14 @@ def online_fallback(
 
 
 def supports_triplet(q, k, table, maxq):
-    """The measured long-query, long-cache region; short shapes retain v8."""
+    """Long-query prefill, including the medium-cache region."""
     return (
         os.environ.get("MTHREADS_FA_DISABLE_WS_PREFILL") != "1"
         and table.shape[0] == 1
         and q.dtype == torch.bfloat16
         and q.shape[2] == 256
         and maxq >= 4096
-        and table.shape[1] * k.shape[1] >= 16384
+        and table.shape[1] * k.shape[1] >= 4096
     )
 
 
