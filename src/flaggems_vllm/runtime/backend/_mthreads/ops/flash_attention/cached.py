@@ -18,7 +18,9 @@ try:
 except ImportError:
     launch_prefill = None
 
-_MAX_CACHE_BYTES = 256 * 1024 * 1024
+# Bound K/V workspace without falling off the cached route just beyond 64K.
+# The S5000 full-shape workload needs up to 520 MiB for the compacted K/V.
+_MAX_CACHE_BYTES = 1024 * 1024 * 1024
 
 
 def supports_cached(q, k, v, table, maxq, window, softcap, alibi, plan):
