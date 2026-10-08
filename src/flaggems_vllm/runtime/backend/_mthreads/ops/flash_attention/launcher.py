@@ -10,6 +10,7 @@ from .common import validate_inputs
 from .decode_tile import launch_decode_tile, supports_decode_tile
 from .direct import launch_direct
 from .scheduling import select_plan
+from .single_kv import launch_single_kv, supports_single_kv
 from .splitkv import launch_splitkv
 
 
@@ -101,6 +102,20 @@ def launch_attention(
             (q.shape[1], q.shape[0]), dtype=torch.float32, device=q.device
         )
         if q.shape[0]:
+            if supports_single_kv(
+                q,
+                k,
+                block_table,
+                max_seqlen_q,
+                max_seqlen_k,
+                window,
+                softcap,
+                alibi_slopes,
+            ):
+                launch_single_kv(
+                    q, k, v, out, lse, cu_seqlens_q, seqused_k, block_table, scale
+                )
+                return (out, lse) if return_softmax_lse else out
             if supports_decode_tile(
                 q, k, block_table, max_seqlen_q, window, softcap, alibi_slopes, plan
             ):
